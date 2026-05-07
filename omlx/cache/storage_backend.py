@@ -72,6 +72,18 @@ class StorageBackend(ABC):
         it on exit. Yields `None` if the key is absent.
         """
 
+    def put_manifest(self, name: str, data: bytes) -> None:
+        """Atomically publish a name-addressed blob (the second namespace
+        in the kv_store_v1 ABI). Used by the cache for periodic index
+        snapshots so a remote backend can restore the in-memory index
+        across process restarts. Default uses `put`; override on
+        backends that have a dedicated manifest namespace."""
+        self.put(f"_manifest/{name}", data)
+
+    def get_manifest(self, name: str) -> bytes | None:
+        """Companion to `put_manifest`. Returns None if absent."""
+        return self.get(f"_manifest/{name}")
+
     def close(self) -> None:
         """Release resources. Default is no-op; remote backends override."""
 

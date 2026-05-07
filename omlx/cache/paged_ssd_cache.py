@@ -691,7 +691,8 @@ class PagedSSDCacheManager(CacheManager):
 
         # Initialize directory structure and scan existing files. Only
         # the local-fs backend lays out subdirectories on disk and walks
-        # them at startup; remote backends warm up lazily.
+        # them at startup. Remote backends restore the index from a
+        # manifest snapshot below.
         if (
             self._cache_dir
             and not self._hot_cache_only
@@ -699,6 +700,14 @@ class PagedSSDCacheManager(CacheManager):
         ):
             self._init_directories()
             self._scan_existing_files()
+        elif self._storage_backend is not None and not self._hot_cache_only:
+            self._restore_index_from_manifest()
+
+        # Save-throttling: snapshot the index manifest every N save_block
+        # calls so a process restart can resume warm. The fs backend
+        # rebuilds via dir scan and does not need this.
+        self._index_snapshot_interval = 16
+        self._writes_since_snapshot = 0
 
         # --- Background writer for non-blocking saves ---
         self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
@@ -922,6 +931,69 @@ class PagedSSDCacheManager(CacheManager):
             f"errors={errors}, total_size={format_bytes(self._index.total_size)}"
         )
 
+    # ---- Index snapshot for remote backends -------------------------------
+    #
+    # Local-fs persists the index implicitly: every block is a file on
+    # disk, so a fresh process can rebuild by walking the directory. A
+    # remote backend (memkv, redis, s3) has no enumerate primitive in the
+    # kv_store_v1 ABI, so the in-memory index would be empty after a
+    # process restart and every prior block would be re-prefilled. We
+    # close that gap by serialising the index dict to a single manifest
+    # blob and stashing it under a well-known name; the next process
+    # pulls it back at startup.
+
+    _INDEX_MANIFEST_NAME = "__omlx_paged_ssd_index__"
+
+    def _snapshot_index_to_manifest(self) -> None:
+        """Serialise the in-memory block index and publish it as a
+        manifest. Called periodically from the writer thread (every
+        `_index_snapshot_interval` saves) and once on shutdown."""
+        if self._storage_backend is None or self._backend_is_local_fs:
+            return
+        try:
+            with self._index._lock:  # consistent snapshot
+                entries = [m.to_dict() for m in self._index._index.values()]
+            payload = json.dumps({"version": 1, "entries": entries}).encode("utf-8")
+            self._storage_backend.put_manifest(self._INDEX_MANIFEST_NAME, payload)
+            logger.debug(
+                f"Snapshotted SSD index manifest: {len(entries)} entries, "
+                f"{format_bytes(len(payload))}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to snapshot SSD index manifest: {e}")
+
+    def _restore_index_from_manifest(self) -> None:
+        """Pull the index manifest back from the backend at startup. The
+        scan returns empty for the fs backend (different code path) so
+        this is only called for remote backends."""
+        if self._storage_backend is None:
+            return
+        try:
+            blob = self._storage_backend.get_manifest(self._INDEX_MANIFEST_NAME)
+        except Exception as e:
+            logger.info(f"No SSD index manifest to restore: {e}")
+            return
+        if not blob:
+            logger.info("No SSD index manifest present on backend; starting cold")
+            return
+        try:
+            payload = json.loads(blob)
+            entries = payload.get("entries", [])
+            restored = 0
+            for d in entries:
+                try:
+                    md = PagedSSDBlockMetadata.from_dict(d)
+                    self._index.add(md)
+                    restored += 1
+                except Exception as e:
+                    logger.debug(f"Skipped index entry: {e}")
+            logger.info(
+                f"Restored SSD index manifest: {restored}/{len(entries)} entries, "
+                f"total_size={format_bytes(self._index.total_size)}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to parse SSD index manifest: {e}")
+
     def _read_file_metadata(self, file_path: Path) -> PagedSSDBlockMetadata | None:
         """
         Read metadata from an existing cache file.
@@ -1065,6 +1137,15 @@ class PagedSSDCacheManager(CacheManager):
                         self._storage_backend.delete(block_hash.hex())
                     except Exception:
                         pass
+
+                # Periodic index snapshot for remote backends. Cheap if
+                # the manifest size stays small (~256 bytes per block);
+                # noop on fs backends.
+                if not self._backend_is_local_fs:
+                    self._writes_since_snapshot += 1
+                    if self._writes_since_snapshot >= self._index_snapshot_interval:
+                        self._writes_since_snapshot = 0
+                        self._snapshot_index_to_manifest()
 
             except Exception as e:
                 if isinstance(e, OSError) and e.errno in (
@@ -2249,10 +2330,22 @@ class PagedSSDCacheManager(CacheManager):
                     f"SSD cache writer thread did not stop within {timeout}s"
                 )
 
+        # Final index snapshot on remote backends so the next process
+        # can resume warm without re-prefilling everything.
+        if not self._backend_is_local_fs and self._storage_backend is not None:
+            self._snapshot_index_to_manifest()
+
         # Clear hot cache
         with self._hot_cache_lock:
             self._hot_cache.clear()
             self._hot_cache_total_bytes = 0
+
+        # Release the backend (closes TCP connection on memkv etc.)
+        if self._storage_backend is not None:
+            try:
+                self._storage_backend.close()
+            except Exception:
+                pass
 
         logger.debug("PagedSSDCacheManager closed")
 

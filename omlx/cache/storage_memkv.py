@@ -245,6 +245,39 @@ class MemkvBackend(StorageBackend):
             return None
         return _peek_safetensors_metadata(blob)
 
+    def put_manifest(self, name: str, data: bytes) -> None:
+        """Use the kv_store_v1 vtable's name-addressed manifest namespace
+        directly so the consumer's index snapshots travel under the same
+        keying convention the spec defines."""
+        self._check_open()
+        with self._lock:
+            rc = self._vt.put_manifest(
+                self._handle,
+                name.encode("utf-8"),
+                (ctypes.c_uint8 * len(data)).from_buffer_copy(data) if data else (ctypes.c_uint8 * 0)(),
+                len(data),
+            )
+            if rc < 0:
+                raise OSError(f"put_manifest({name!r}) returned {rc}")
+
+    def get_manifest(self, name: str) -> bytes | None:
+        self._check_open()
+        out_data = _U8Ptr()
+        out_len = ctypes.c_size_t(0)
+        rc = self._vt.get_manifest(
+            self._handle,
+            name.encode("utf-8"),
+            ctypes.byref(out_data), ctypes.byref(out_len),
+        )
+        if rc < 0:
+            return None
+        try:
+            return bytes((ctypes.c_uint8 * out_len.value).from_address(
+                ctypes.addressof(out_data.contents)
+            ))
+        finally:
+            self._free(ctypes.cast(out_data, ctypes.c_void_p))
+
     @contextmanager
     def open_for_load(self, key: str) -> Iterator[Path | None]:
         """Materialise the blob as a tempfile so callers can pass a path
