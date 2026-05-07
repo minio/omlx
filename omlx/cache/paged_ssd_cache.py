@@ -1084,6 +1084,17 @@ class PagedSSDCacheManager(CacheManager):
             try:
                 item = self._write_queue.get(timeout=1.0)
             except queue.Empty:
+                # Idle: flush the backend's buffered puts so the next
+                # reader sees everything we wrote. Coalescing many
+                # block puts into one EXISTS + batch_put round-trip is
+                # the whole point of remote backends — without this
+                # we'd round-trip per-block and lose the win.
+                try:
+                    flush = getattr(self._storage_backend, "flush", None)
+                    if callable(flush):
+                        flush()
+                except Exception as e:
+                    logger.warning(f"Backend flush failed: {e}")
                 # Exit if shutdown was requested and queue is empty
                 if self._writer_shutdown.is_set():
                     break
@@ -1175,6 +1186,18 @@ class PagedSSDCacheManager(CacheManager):
                 # When hot cache is disabled, remove temporary read buffer entry
                 if not self._hot_cache_enabled:
                     self._hot_cache_remove(block_hash)
+
+            # Drained the queue? Flush eagerly so a reader on the
+            # inference thread doesn't pay a cold-flush penalty on its
+            # first get(). When more writes are pending, batch_put +
+            # EXISTS-skip continue to coalesce.
+            if self._write_queue.empty():
+                try:
+                    flush = getattr(self._storage_backend, "flush", None)
+                    if callable(flush):
+                        flush()
+                except Exception as e:
+                    logger.debug(f"Eager backend flush failed: {e}")
 
     def save_block(
         self,

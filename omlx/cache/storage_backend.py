@@ -72,6 +72,12 @@ class StorageBackend(ABC):
         it on exit. Yields `None` if the key is absent.
         """
 
+    def flush(self) -> None:
+        """Force any backend-side buffered puts to the wire. No-op for
+        backends that don't buffer; remote backends override to push the
+        accumulated chunks in one EXISTS + batch_put round-trip."""
+        return
+
     def put_manifest(self, name: str, data: bytes) -> None:
         """Atomically publish a name-addressed blob (the second namespace
         in the kv_store_v1 ABI). Used by the cache for periodic index

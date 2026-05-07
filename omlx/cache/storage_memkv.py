@@ -180,10 +180,19 @@ class MemkvBackend(StorageBackend):
         self._free = _load_libc_free()
         self._closed = False
         self._lock = threading.Lock()
+        # Set when a put has not yet been flushed via put_manifest. Reads
+        # auto-flush so writes are visible read-after-write on the same
+        # backend instance; the writer thread flushes when its queue
+        # drains to amortise round-trips across many puts.
+        self._unflushed = False
 
     # ---- StorageBackend impl ---------------------------------------------
 
     def put(self, key: str, data: bytes) -> int:
+        """Buffer the put; the backend coalesces buffered chunks into a
+        single EXISTS + batch_put round-trip on the next `flush()` or
+        `put_manifest()` call. Callers that need read-after-write
+        consistency must flush before reading the same key."""
         self._check_open()
         hash_bytes, hash_len = _decode_key_hex(key)
         rc = self._vt.put_chunk(
@@ -191,19 +200,28 @@ class MemkvBackend(StorageBackend):
             hash_bytes, hash_len,
             (ctypes.c_uint8 * len(data)).from_buffer_copy(data), len(data),
         )
-        # The kv_store backend does NOT make puts visible until the next
-        # put_manifest call (it buffers chunks for EXISTS-skip dedup). For
-        # oMLX's per-block save model we don't have a "manifest" boundary,
-        # so we synthesise one: write a sentinel manifest right after each
-        # block put. The manifest itself is a stable name; replacing it is
-        # cheap and triggers the backend's flush.
         if rc < 0:
             raise OSError(f"put_chunk for {key} returned {rc}")
-        self._flush_via_sentinel_manifest()
+        self._unflushed = True
         return len(data)
+
+    def flush(self) -> None:
+        """Force any buffered puts to the server. Cheap if the buffer is
+        empty. The MemKV backend implements this by writing a sentinel
+        manifest, which makes the kv_store_v1 backend run its
+        EXISTS-skip + batch_put pipeline in one shot."""
+        if not getattr(self, "_unflushed", False):
+            return
+        self._flush_via_sentinel_manifest()
+        self._unflushed = False
 
     def get(self, key: str) -> bytes | None:
         self._check_open()
+        # Read-after-write consistency: ensure any buffered puts are
+        # visible to a `get` for the same key from the same backend
+        # instance.
+        if self._unflushed:
+            self.flush()
         hash_bytes, hash_len = _decode_key_hex(key)
         out_data = _U8Ptr()
         out_len = ctypes.c_size_t(0)
@@ -222,9 +240,10 @@ class MemkvBackend(StorageBackend):
             self._free(ctypes.cast(out_data, ctypes.c_void_p))
 
     def exists(self, key: str) -> bool:
-        # No dedicated EXISTS in the v1 ABI for chunks; round-trip a get
-        # and discard. This is only called on the slow path (cache miss
-        # check); the hot save/load paths don't use it.
+        # No dedicated chunk-level EXISTS in the v1 ABI for the consumer
+        # surface; round-trip a get and discard. `get` already flushes
+        # any buffered puts, so read-after-write on the same instance is
+        # consistent.
         return self.get(key) is not None
 
     def delete(self, key: str) -> None:
