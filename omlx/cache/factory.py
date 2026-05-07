@@ -111,18 +111,32 @@ class CacheFactory:
         Returns:
             Configured PagedSSDCacheManager instance, or None if disabled.
         """
-        if config.paged_ssd_cache_dir is None:
+        # paged-SSD is enabled when either a local cache_dir is set or a
+        # remote `paged_ssd_cache_uri` (e.g. memkv://...) is configured.
+        cache_uri = getattr(config, "paged_ssd_cache_uri", None)
+        if config.paged_ssd_cache_dir is None and not cache_uri:
             return None
 
         from .paged_ssd_cache import PagedSSDCacheManager
+        from .storage_backend import make_backend
 
         cache_dir = config.paged_ssd_cache_dir
-        if model_name:
+        if cache_dir and model_name:
             cache_dir = cache_dir / model_name
+
+        storage_backend = None
+        if cache_uri:
+            # Per-model namespace appended so multiple models on the same
+            # MemKV cluster (or any other remote backend) don't collide.
+            scoped_uri = cache_uri.rstrip("/")
+            if model_name:
+                scoped_uri = f"{scoped_uri}/{model_name}"
+            storage_backend = make_backend(scoped_uri)
 
         return PagedSSDCacheManager(
             cache_dir=cache_dir,
             max_size_bytes=config.max_paged_ssd_cache_size,
+            storage_backend=storage_backend,
         )
 
     @staticmethod

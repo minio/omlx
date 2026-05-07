@@ -253,28 +253,19 @@ def _restore_tensor_from_bytes(
     return arr.reshape(shape)
 
 
-def _write_safetensors_no_mx(
-    path: str,
+def _build_safetensors_bytes(
     tensors_raw: dict[str, tuple[bytes, str, list[int]]],
     metadata: dict[str, str] | None = None,
-) -> int:
-    """Write a safetensors file without any mx/Metal API calls.
+) -> bytes:
+    """Construct a safetensors binary blob in memory without any mx/Metal
+    API calls. Output is byte-identical to what `_write_safetensors_no_mx`
+    produces on disk and is fully compatible with
+    `mx.load(path, return_metadata=True)`.
 
-    Safe to call from background threads. Produces files fully compatible
-    with mx.load(path, return_metadata=True).
-
-    The safetensors binary format:
-      [8 bytes: header_size as little-endian uint64]
-      [header_size bytes: JSON header]
-      [remaining bytes: concatenated tensor data]
-
-    Args:
-        path: Output file path (must include .safetensors extension).
-        tensors_raw: Dict of {name: (raw_bytes, dtype_str, shape)}.
-        metadata: Optional string-to-string metadata dict.
-
-    Returns:
-        Total file size in bytes.
+    Layout:
+        [8 bytes: header_size as little-endian uint64]
+        [header_size bytes: JSON header]
+        [remaining bytes: concatenated tensor data]
     """
     offset = 0
     header_tensors = {}
@@ -298,13 +289,25 @@ def _write_safetensors_no_mx(
     pad = (8 - len(header_json) % 8) % 8
     header_json += b" " * pad
 
-    with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(header_json)))
-        f.write(header_json)
-        for d in all_data:
-            f.write(d)
+    parts = [struct.pack("<Q", len(header_json)), header_json]
+    parts.extend(all_data)
+    return b"".join(parts)
 
-    return 8 + len(header_json) + offset
+
+def _write_safetensors_no_mx(
+    path: str,
+    tensors_raw: dict[str, tuple[bytes, str, list[int]]],
+    metadata: dict[str, str] | None = None,
+) -> int:
+    """Write a safetensors file directly to disk. Safe from background
+    threads (no mx/Metal API). Returns total file size in bytes.
+
+    Built on top of `_build_safetensors_bytes` so the in-memory and
+    on-disk paths share one serializer."""
+    blob = _build_safetensors_bytes(tensors_raw, metadata)
+    with open(path, "wb") as f:
+        f.write(blob)
+    return len(blob)
 
 
 def parse_size(size_str: str) -> int:
@@ -613,20 +616,49 @@ class PagedSSDCacheManager(CacheManager):
         max_size_bytes: int,
         hot_cache_max_bytes: int = 0,
         hot_cache_only: bool = False,
+        storage_backend=None,
     ):
         """
         Initialize the SSD cache manager.
 
         Args:
-            cache_dir: Directory for SSD cache files.
+            cache_dir: Directory for SSD cache files. Used as the local-fs
+                backend root when `storage_backend` is None. May be None when
+                a remote `storage_backend` is provided.
             max_size_bytes: Maximum total size of SSD cache.
             hot_cache_max_bytes: Maximum in-memory hot cache size in bytes.
                 0 means disabled (default).
             hot_cache_only: When True, skip directory init and writer thread.
                 All data is stored exclusively in the hot cache (RAM only).
                 No SSD I/O is performed.
+            storage_backend: Optional `StorageBackend` instance (e.g.
+                `MemkvBackend("memkv://host:port/ns")`) that takes the place
+                of direct filesystem reads/writes. When provided the
+                paged-SSD layout uses `cache_dir` only as a scratch area
+                (or not at all on remote backends) and the on-disk scan is
+                skipped — the index warms up lazily as new requests arrive.
         """
         self._cache_dir = cache_dir
+        # Lazy import keeps the dependency footprint of the existing
+        # cache_dir-only path unchanged.
+        from .storage_backend import LocalFSBackend, StorageBackend
+
+        if storage_backend is not None:
+            if not isinstance(storage_backend, StorageBackend):
+                raise TypeError(
+                    f"storage_backend must be a StorageBackend, got {type(storage_backend).__name__}"
+                )
+            self._storage_backend = storage_backend
+            # Remote backends carry their own persistence; we still allow
+            # cache_dir to be set so the legacy file_path math in the
+            # block index keeps working, but we never read from disk.
+            self._backend_is_local_fs = isinstance(storage_backend, LocalFSBackend)
+        elif cache_dir is not None and not hot_cache_only:
+            self._storage_backend = LocalFSBackend(cache_dir)
+            self._backend_is_local_fs = True
+        else:
+            self._storage_backend = None
+            self._backend_is_local_fs = True
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
         self._hot_cache_only = hot_cache_only
@@ -657,9 +689,14 @@ class PagedSSDCacheManager(CacheManager):
         self._hot_cache_total_bytes: int = 0
         self._hot_cache_lock = threading.Lock()
 
-        # Initialize directory structure and scan existing files
-        # Skip in hot_cache_only mode: no SSD I/O, so no directories needed.
-        if self._cache_dir and not self._hot_cache_only:
+        # Initialize directory structure and scan existing files. Only
+        # the local-fs backend lays out subdirectories on disk and walks
+        # them at startup; remote backends warm up lazily.
+        if (
+            self._cache_dir
+            and not self._hot_cache_only
+            and self._backend_is_local_fs
+        ):
             self._init_directories()
             self._scan_existing_files()
 
@@ -983,36 +1020,37 @@ class PagedSSDCacheManager(CacheManager):
             if item is None:  # Sentinel for shutdown
                 break
 
-            # Unlink task: tuple ('unlink', file_path). Used to defer LRU file
-            # deletion off the inference thread (see _enforce_size_limit_for_new_block).
-            # Sequential queue processing prevents race with subsequent writes
-            # to the same block_hash (write tasks always queued after unlink).
+            # Unlink task: tuple ('unlink', file_path). Used to defer LRU
+            # eviction off the inference thread (see
+            # _enforce_size_limit_for_new_block). Sequential queue
+            # processing prevents race with subsequent writes to the same
+            # block_hash (write tasks are always queued after unlink).
+            #
+            # The path's stem is the block hex hash; the backend resolves
+            # that into whatever it needs (filesystem path, memkv key,
+            # ...).
             if isinstance(item[0], str) and item[0] == "unlink":
                 _, unlink_path = item
                 try:
-                    if unlink_path.exists():
-                        unlink_path.unlink()
-                        self._stats["evictions"] += 1
-                        logger.debug(f"Evicted SSD cache file (async): {unlink_path}")
+                    self._storage_backend.delete(unlink_path.stem)
+                    self._stats["evictions"] += 1
+                    logger.debug(f"Evicted SSD cache object (async): {unlink_path.stem}")
                 except FileNotFoundError:
                     pass
                 except Exception as e:
-                    logger.warning(f"Failed to delete evicted file {unlink_path}: {e}")
+                    logger.warning(f"Failed to delete evicted object {unlink_path.stem}: {e}")
                 continue
 
             block_hash, tensors_raw, metadata, file_path = item
-            temp_path = None
 
             try:
-                # Write safetensors file using pure Python (no mx/Metal API)
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
-                actual_size = _write_safetensors_no_mx(
-                    str(temp_path), tensors_raw, metadata
-                )
-
-                # Atomic rename to final path
-                os.rename(str(temp_path), str(file_path))
+                # Build the safetensors blob in memory once, then push it
+                # through whichever StorageBackend is configured. The
+                # local-fs backend writes via tmp+rename to file_path's
+                # parent; remote backends (e.g. memkv) do an atomic
+                # network put using the block hash as the key.
+                blob = _build_safetensors_bytes(tensors_raw, metadata)
+                actual_size = self._storage_backend.put(block_hash.hex(), blob)
 
                 # Update index with actual file size
                 self._index.update_file_size(block_hash, actual_size)
@@ -1021,10 +1059,10 @@ class PagedSSDCacheManager(CacheManager):
                 if not self._index.contains(block_hash):
                     logger.debug(
                         f"Block {block_hash.hex()[:16]} evicted during write, "
-                        f"cleaning up file"
+                        f"cleaning up object"
                     )
                     try:
-                        file_path.unlink()
+                        self._storage_backend.delete(block_hash.hex())
                     except Exception:
                         pass
 
@@ -1042,15 +1080,13 @@ class PagedSSDCacheManager(CacheManager):
                         f"Background write failed for " f"{block_hash.hex()[:16]}: {e}"
                     )
                 self._stats["errors"] += 1
-                # Remove from index since file wasn't written
+                # Remove from index since the write didn't land
                 self._index.remove(block_hash)
-                # Clean up temp and final files
-                for p in (temp_path, file_path):
-                    try:
-                        if p is not None and isinstance(p, Path) and p.exists():
-                            p.unlink()
-                    except Exception:
-                        pass
+                # Best-effort cleanup of any partial state
+                try:
+                    self._storage_backend.delete(block_hash.hex())
+                except Exception:
+                    pass
             finally:
                 # Remove from pending write tracking
                 with self._pending_write_hashes_lock:
@@ -1632,8 +1668,8 @@ class PagedSSDCacheManager(CacheManager):
 
         file_path = metadata.file_path
 
-        if not file_path.exists():
-            logger.warning(f"SSD cache file missing: {file_path}")
+        if not self._storage_backend.exists(block_hash.hex()):
+            logger.warning(f"SSD cache object missing: {block_hash.hex()}")
             self._index.remove(block_hash)
             self._stats["misses"] += 1
             return None
@@ -1644,7 +1680,17 @@ class PagedSSDCacheManager(CacheManager):
             # Previous executor-based approach caused deadlocks when
             # mx.load() in a worker thread contested Metal GPU resources
             # with the main inference thread.
-            arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
+            #
+            # `open_for_load` yields a real filesystem path that
+            # `mx.load` can read — for the local-fs backend it's the
+            # already-on-disk path; for remote backends (memkv) it
+            # materialises the bytes to a tempfile and unlinks on exit.
+            with self._storage_backend.open_for_load(block_hash.hex()) as load_path:
+                if load_path is None:
+                    self._index.remove(block_hash)
+                    self._stats["misses"] += 1
+                    return None
+                arrays, file_metadata = mx.load(str(load_path), return_metadata=True)
 
             # Defensive: even if the index is stale (e.g. from a previous
             # run that pre-dates the format version field), reject blocks
@@ -1698,7 +1744,7 @@ class PagedSSDCacheManager(CacheManager):
             # Remove corrupted entry
             self._index.remove(block_hash)
             try:
-                file_path.unlink()
+                self._storage_backend.delete(block_hash.hex())
             except Exception:
                 pass
             return None
@@ -1775,8 +1821,8 @@ class PagedSSDCacheManager(CacheManager):
 
         file_path = block_metadata.file_path
 
-        if not file_path.exists():
-            logger.warning(f"SSD cache file missing: {file_path}")
+        if not self._storage_backend.exists(block_hash.hex()):
+            logger.warning(f"SSD cache object missing: {block_hash.hex()}")
             self._index.remove(block_hash)
             self._stats["misses"] += 1
             return None, None
@@ -1784,7 +1830,12 @@ class PagedSSDCacheManager(CacheManager):
         try:
             # Load directly on the inference thread (Metal-safe).
             # See load_block() for rationale on removing the executor.
-            arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
+            with self._storage_backend.open_for_load(block_hash.hex()) as load_path:
+                if load_path is None:
+                    self._index.remove(block_hash)
+                    self._stats["misses"] += 1
+                    return None, None
+                arrays, file_metadata = mx.load(str(load_path), return_metadata=True)
 
             # Defensive version check, mirrors load_block().
             if (
@@ -1858,7 +1909,7 @@ class PagedSSDCacheManager(CacheManager):
             # Remove corrupted entry
             self._index.remove(block_hash)
             try:
-                file_path.unlink()
+                self._storage_backend.delete(block_hash.hex())
             except Exception:
                 pass
             return None, None
@@ -1910,12 +1961,11 @@ class PagedSSDCacheManager(CacheManager):
                 return False
 
             try:
-                if metadata.file_path.exists():
-                    metadata.file_path.unlink()
-                    logger.debug(f"Deleted SSD cache file: {metadata.file_path}")
+                self._storage_backend.delete(block_hash.hex())
+                logger.debug(f"Deleted SSD cache object: {block_hash.hex()}")
                 return True
             except Exception as e:
-                logger.error(f"Failed to delete SSD cache file: {e}")
+                logger.error(f"Failed to delete SSD cache object: {e}")
                 return False
 
     # Use at most 99% of available disk space to avoid filling disk completely
@@ -1985,14 +2035,13 @@ class PagedSSDCacheManager(CacheManager):
                 try:
                     self._write_queue.put_nowait(("unlink", metadata.file_path))
                 except queue.Full:
-                    # Queue saturated — fall back to inline unlink so size
+                    # Queue saturated — fall back to inline delete so size
                     # accounting stays consistent. Rare path.
                     try:
-                        if metadata.file_path.exists():
-                            metadata.file_path.unlink()
-                            self._stats["evictions"] += 1
+                        self._storage_backend.delete(metadata.file_path.stem)
+                        self._stats["evictions"] += 1
                     except Exception as e:
-                        logger.warning(f"Failed to delete evicted file: {e}")
+                        logger.warning(f"Failed to delete evicted object: {e}")
 
     def enforce_size_limit(self) -> int:
         """
@@ -2014,11 +2063,10 @@ class PagedSSDCacheManager(CacheManager):
             for metadata in evicted:
                 # Do NOT remove from hot cache — see _enforce_size_limit_for_new_block
                 try:
-                    if metadata.file_path.exists():
-                        metadata.file_path.unlink()
-                        self._stats["evictions"] += 1
+                    self._storage_backend.delete(metadata.file_path.stem)
+                    self._stats["evictions"] += 1
                 except Exception as e:
-                    logger.warning(f"Failed to delete evicted file: {e}")
+                    logger.warning(f"Failed to delete evicted object: {e}")
 
             freed = initial_size - self._index.total_size
             logger.info(
@@ -2175,9 +2223,8 @@ class PagedSSDCacheManager(CacheManager):
                 entries_to_flush = list(self._hot_cache.items())
             flushed = 0
             for block_hash, entry in entries_to_flush:
-                # Skip blocks already written to SSD
-                blk_meta = entry.get("block_metadata")
-                if blk_meta and blk_meta.file_path.exists():
+                # Skip blocks already persisted to the backend
+                if self._storage_backend.exists(block_hash.hex()):
                     continue
                 if self._enqueue_ssd_write(block_hash, entry):
                     flushed += 1

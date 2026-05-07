@@ -199,14 +199,22 @@ def serve_command(args):
     scheduler_config = settings.to_scheduler_config()
     # Set paged SSD cache options
     scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
+    # Optional remote storage URI (kv_store_v1 ABI). When set, paged
+    # blocks travel through libkv_store_<scheme>.{so,dylib} instead of
+    # local disk; the local cache_dir, if also set, becomes a scratch
+    # area used only for reading existing files left by previous runs.
+    scheduler_config.paged_ssd_cache_uri = getattr(args, "paged_ssd_cache_uri", None)
     # Determine cache max size: CLI arg > settings (with auto resolution)
-    if paged_ssd_cache_dir:
+    if paged_ssd_cache_dir or scheduler_config.paged_ssd_cache_uri:
         if args.paged_ssd_cache_max_size:
             # CLI argument specified explicitly
             cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
-        else:
+        elif paged_ssd_cache_dir:
             # Use settings value (handles "auto" -> 10% of SSD capacity)
             cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(settings.base_path)
+        else:
+            # Remote backend with no explicit cap — let backend manage
+            cache_max_size_bytes = 100 * 1024 * 1024 * 1024  # 100 GB default
         scheduler_config.paged_ssd_cache_max_size = cache_max_size_bytes
     else:
         scheduler_config.paged_ssd_cache_max_size = 0
@@ -572,6 +580,17 @@ Example directory structure:
         type=str,
         default=None,
         help="Directory for paged SSD cache storage (enables oMLX prefix cache)",
+    )
+    serve_parser.add_argument(
+        "--paged-ssd-cache-uri",
+        type=str,
+        default=None,
+        help=(
+            "Remote storage URI for paged blocks via the kv_store_v1 ABI "
+            "(e.g. memkv://10.0.0.1:9900/omlx). Loaded via dlopen of "
+            "libkv_store_<scheme>.{so,dylib}. Replaces / complements "
+            "--paged-ssd-cache-dir. See https://min.io/memkv/kv-store-abi."
+        ),
     )
     serve_parser.add_argument(
         "--paged-ssd-cache-max-size",

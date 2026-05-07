@@ -4677,12 +4677,21 @@ class Scheduler:
                 else None
             )
 
-            # Initialize paged SSD cache manager for SSD storage
+            # Initialize paged SSD cache manager for SSD storage. When the
+            # scheduler config carries a `paged_ssd_cache_uri`, route block
+            # IO through the corresponding `kv_store_v1` backend
+            # (libkv_store_<scheme>.{so,dylib}) instead of local disk.
+            cache_uri = getattr(self.config, "paged_ssd_cache_uri", None)
+            storage_backend = None
+            if cache_uri and not self.config.hot_cache_only:
+                from omlx.cache.storage_backend import make_backend
+                storage_backend = make_backend(cache_uri)
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
+                storage_backend=storage_backend,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
